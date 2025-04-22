@@ -184,7 +184,7 @@ function startProcessing() {
             stopProcessing();
             statusText.textContent = 'Processing Error: ' + error.message;
         }
-    }, 33); // ~30 FPS
+    }, 60); // ~30 FPS
 }
 
 // Stop the frame processing
@@ -192,17 +192,18 @@ function stopProcessing() {
     if (processingInterval) {
         clearInterval(processingInterval);
     }
-    
+
     // Reset all keys and stop all sounds
     pianoKeys.forEach(key => {
         key.isActive = false;
-        stopSound(key.id);
+        stopSound(key.id); // Ensure all sounds are stopped
     });
-    
-    playingKeys = [];
-    drawPianoKeys();
-    
-    isProcessingActive = false;
+
+    playingKeys = []; // Clear the playing keys array
+    drawPianoKeys(); // Redraw the piano keys to reflect inactive state
+
+    isProcessingActive = false; // Update the processing state
+    console.log('Processing stopped'); // Debug log
 }
 
 // Process the current video frame
@@ -211,30 +212,32 @@ function processCurrentFrame() {
     const videoCanvas = document.getElementById('videoCanvas');
     const ctxVideo = videoCanvas.getContext('2d');
     ctxVideo.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
-    
-    // Process the frame using OpenCV.js
-    const currentFrame = cv.imread(videoCanvas);
-    
-    // Use background subtraction to detect movement
-    const movementMask = backgroundSubtraction(currentFrame);
-    
-    // Show the movement mask on process canvas
-    cv.imshow('processCanvas', movementMask);
-    
-    // Detect blobs (feet) in the movement mask
-    const footPositions = detectBlobs(movementMask);
-    
-    // Update piano key states based on detected feet
-    updateKeyStates(footPositions);
-    
-    // Draw the piano keys with updated states
-    drawPianoKeys();
-    
-    // Clean up OpenCV objects
-    currentFrame.delete();
-    movementMask.delete();
+    try {
+        // Process the frame using OpenCV.js
+        const currentFrame = cv.imread(videoCanvas);
+        
+        // Use background subtraction to detect movement
+        const movementMask = backgroundSubtraction(currentFrame);
+        
+        // Show the movement mask on process canvas
+        cv.imshow('processCanvas', movementMask);
+        
+        // Detect blobs (feet) in the movement mask
+        const footPositions = detectBlobs(movementMask);
+        
+        // Update piano key states based on detected feet
+        updateKeyStates(footPositions);
+        
+        // Draw the piano keys with updated states
+        drawPianoKeys();
+        
+        // Clean up OpenCV objects
+        currentFrame.delete();
+        movementMask.delete();
+    } catch (error) {
+        console.error('Frame processing error:', error);
+    }
 }
-
 // Background subtraction algorithm
 function backgroundSubtraction(currentFrame) {
     // Convert frames to grayscale for easier processing
@@ -248,7 +251,7 @@ function backgroundSubtraction(currentFrame) {
     cv.absdiff(grayBackground, grayCurrentFrame, diffFrame);
     
     // Apply threshold to get binary mask of movement
-    const thresholdValue = 30; // Adjust based on lighting conditions
+    const thresholdValue = 100; // Adjust based on lighting conditions
     const mask = new cv.Mat();
     cv.threshold(diffFrame, mask, thresholdValue, 255, cv.THRESH_BINARY);
     
@@ -291,23 +294,20 @@ function detectBlobs(mask) {
     for (let i = 0; i < contours.size(); i++) {
         const contour = contours.get(i);
         const area = cv.contourArea(contour);
-        
-        // Filter by area to eliminate small noise blobs
         if (area > minFootArea) {
-            // Get center of the blob
             const moments = cv.moments(contour);
-            if (moments.m00 > 0) { // Prevent division by zero
+            if (moments.m00 > 0) {
                 const centerX = moments.m10 / moments.m00;
                 const centerY = moments.m01 / moments.m00;
-                
-                // Normalize to 0-1 range (easier to map to piano canvas)
-                const normalizedX = centerX / videoWidth;
-                const normalizedY = centerY / videoHeight;
-                
-                footPositions.push({ x: normalizedX, y: normalizedY });
+                footPositions.push({
+                    x: centerX / videoWidth,
+                    y: centerY / videoHeight
+                });
             }
         }
+        contour.delete(); // ✅ This is critical
     }
+    
     
     // Clean up
     contours.delete();
@@ -345,12 +345,8 @@ function updateKeyStates(footPositions) {
     
     // Play sounds for newly activated keys and stop sounds for deactivated keys
     pianoKeys.forEach(key => {
-        if (key.isActive && !playingKeys.includes(key.id)) {
+        if (key.isActive) {
             playSound(key.id);
-            playingKeys.push(key.id);
-        } else if (!key.isActive && playingKeys.includes(key.id)) {
-            stopSound(key.id);
-            playingKeys = playingKeys.filter(id => id !== key.id);
         }
     });
 }
@@ -388,7 +384,7 @@ function drawPianoKeys() {
 function playSound(keyId) {
     const key = pianoKeys.find(k => k.id === keyId);
     if (key) {
-        synths[keyId].triggerAttack(key.note);
+        synths[keyId].triggerAttackRelease(key.note, "0.5");
         console.log(`Playing note: ${key.note}`);
     }
 }
