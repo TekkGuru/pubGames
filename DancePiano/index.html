@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Floor Piano</title>
+    <link rel="stylesheet" href="styles.css">
+    <!-- Include OpenCV.js -->
+    <script async src="https://docs.opencv.org/4.5.5/opencv.js" onload="onOpenCVReady();" type="text/javascript"></script>
+    <!-- Include Tone.js for audio -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>Interactive Floor Piano</h1>
+        
+        <div class="controls">
+            <button id="captureBackground">Capture Background</button>
+            <button id="startPiano">Start Piano</button>
+            <div class="status">Status: <span id="statusText">Waiting for OpenCV...</span></div>
+        </div>
+        
+        <div class="video-section">
+            <!-- Video element (hidden, just used for capture) -->
+            <video id="video" autoplay playsinline muted></video>
+            
+            <!-- Canvas elements for processing -->
+            <div class="canvas-container">
+                <div class="canvas-wrapper">
+                    <h3>Camera Feed</h3>
+                    <canvas id="videoCanvas" width="640" height="480"></canvas>
+                </div>
+                <div class="canvas-wrapper">
+                    <h3>Motion Detection</h3>
+                    <canvas id="processCanvas" width="640" height="480"></canvas>
+                </div>
+            </div>
+        </div>
+        
+        <div class="piano-section">
+            <h2>Floor Piano</h2>
+            <div class="canvas-wrapper piano-wrapper">
+                <canvas id="outputCanvas" width="800" height="400"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main JavaScript file -->
+    <script src="app.js"></script>
+</body>
+</html>
