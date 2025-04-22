@@ -328,6 +328,8 @@ function updateKeyStates(footPositions) {
         key.isActive = false;
     });
     
+    const now = Date.now(); // Current time in ms
+
     // Check each foot position against piano keys
     footPositions.forEach(foot => {
         // Map normalized foot position to canvas coordinates
@@ -338,15 +340,30 @@ function updateKeyStates(footPositions) {
             // Check if foot is inside this key
             if (mappedX >= key.x && mappedX <= key.x + key.width &&
                 mappedY >= key.y && mappedY <= key.y + key.height) {
-                key.isActive = true;
+                key.lastActiveTime = now;
             }
         });
     });
     
     // Play sounds for newly activated keys and stop sounds for deactivated keys
+    // Now decide which keys should play or stop
     pianoKeys.forEach(key => {
-        if (key.isActive) {
-            playSound(key.id);
+        const timeSinceLastTouch = now - key.lastActiveTime;
+
+        if (timeSinceLastTouch < 300) { // Still active within last 300ms
+            key.isActive = true;
+            if (!key.isPlaying) {
+                synths[key.id].triggerAttack(key.note);
+                key.isPlaying = true;
+                console.log(`Starting note: ${key.note}`);
+            }
+        } else {
+            key.isActive = false;
+            if (key.isPlaying) {
+                synths[key.id].triggerRelease();
+                key.isPlaying = false;
+                console.log(`Stopping note: ${key.note}`);
+            }
         }
     });
 }
