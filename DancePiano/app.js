@@ -35,8 +35,8 @@ async function setupCamera() {
         // Request camera access
         const stream = await navigator.mediaDevices.getUserMedia({
             'video': {
-                width: 640,
-                height: 480,
+                width: 1280,
+                height: 720,
                 frameRate: { ideal: 30, min: 15 }
             }
         });
@@ -48,8 +48,20 @@ async function setupCamera() {
         return new Promise((resolve) => {
             video.onloadedmetadata = () => {
                 video.play();
+            
+                const width = video.videoWidth;
+                const height = video.videoHeight;
+            
+                // Match canvas sizes to camera resolution
+                ['videoCanvas', 'outputCanvas', 'processCanvas'].forEach(id => {
+                    const canvas = document.getElementById(id);
+                    canvas.width = width;
+                    canvas.height = height;
+                });
+            
+                console.log(`Camera size: ${width}x${height}`);
                 resolve();
-            };
+            };            
         });
     } catch (error) {
         console.error('Error accessing camera:', error);
@@ -184,7 +196,7 @@ function startProcessing() {
             stopProcessing();
             statusText.textContent = 'Processing Error: ' + error.message;
         }
-    }, 60); // ~30 FPS
+    }, 40); // ~30 FPS
 }
 
 // Stop the frame processing
@@ -350,7 +362,7 @@ function updateKeyStates(footPositions) {
     pianoKeys.forEach(key => {
         const timeSinceLastTouch = now - key.lastActiveTime;
 
-        if (timeSinceLastTouch < 300) { // Still active within last 300ms
+        if (timeSinceLastTouch < 100) { // Still active within last 300ms
             key.isActive = true;
             if (!key.isPlaying) {
                 synths[key.id].triggerAttack(key.note);
@@ -409,7 +421,7 @@ function playSound(keyId) {
 // Stop sound for a key
 function stopSound(keyId) {
     synths[keyId].triggerRelease();
-    console.log(`Stopping note: ${key.note}`);
+    console.log(`Stopping note keyID: ${keyId}`);
 }
 
 // Check if OpenCV is already loaded (in case the onload event already fired)
