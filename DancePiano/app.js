@@ -97,7 +97,9 @@ function setupPianoKeys() {
             color: keyColors[i],
             noteName: noteNames[i],
             note: notes[i],
-            isActive: false
+            isActive: false,
+            isPlaying: false,
+            lastActiveTime: 0
         });
     }
     
@@ -160,37 +162,55 @@ function captureBackground() {
     }
 
     try {
+        // Get the video canvas and draw the current frame
         const videoCanvas = document.getElementById('videoCanvas');
         const ctx = videoCanvas.getContext('2d');
         ctx.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
 
+        // Capture this frame as background
         backgroundFrame = cv.imread(videoCanvas);
+        
         isBackgroundCaptured = true;
         statusText.textContent = 'Background Captured - Detecting Corners...';
 
-        // 🔍 Detect white stickers as corners
+        // Find corners
         const corners = findPianoSurfaceCorners(backgroundFrame);
         if (corners.length !== 4) {
             alert(`Detected ${corners.length} corners. Need exactly 4.`);
+            isBackgroundCaptured = false;
+            statusText.textContent = 'Corner detection failed - try again';
             return;
         }
 
-        // ✅ Sort corners (rough sorting TL, TR, BR, BL)
-        corners.sort((a, b) => a.y - b.y);
-        const top = corners.slice(0, 2).sort((a, b) => a.x - b.x);
-        const bottom = corners.slice(2, 4).sort((a, b) => a.x - b.x);
-        const orderedCorners = [top[0], top[1], bottom[1], bottom[0]];
+        // Sort corners in the correct order: TL, TR, BR, BL
+        const centerX = corners.reduce((sum, c) => sum + c.x, 0) / 4;
+        const centerY = corners.reduce((sum, c) => sum + c.y, 0) / 4;
+        
+        corners.sort((a, b) => {
+            // Determine quadrant (TL, TR, BR, BL)
+            const aQuad = (a.x < centerX ? 0 : 1) + (a.y < centerY ? 0 : 2);
+            const bQuad = (b.x < centerX ? 0 : 1) + (b.y < centerY ? 0 : 2);
+            return aQuad - bQuad;
+        });
+        
+        // Get perspective transform matrix
+        transformMatrix = computePerspectiveMatrix(corners);
+        
+        // Draw the detected corners on the process canvas
+        const cornerDisplay = backgroundFrame.clone();
+        for (let i = 0; i < corners.length; i++) {
+            cv.circle(cornerDisplay, new cv.Point(corners[i].x, corners[i].y), 10, 
+                      [255, 0, 0, 255], -1);
+        }
+        cv.imshow('processCanvas', cornerDisplay);
+        cornerDisplay.delete();
 
-        // 🔁 Get perspective transform matrix
-        transformMatrix = computePerspectiveMatrix(orderedCorners);
-
-        statusText.textContent = 'Corners Detected - Perspective Ready';
-        cv.imshow('processCanvas', backgroundFrame);
+        statusText.textContent = 'Corners Detected - Ready to Start Piano';
         console.log('Background captured and transform matrix computed');
 
     } catch (error) {
         console.error('Error capturing background:', error);
-        statusText.textContent = 'Error capturing background';
+        statusText.textContent = 'Error capturing background: ' + error.message;
     }
 }
 
@@ -381,7 +401,8 @@ function stopProcessing() {
     // Reset all keys and stop all sounds
     pianoKeys.forEach(key => {
         key.isActive = false;
-        stopSound(key.id); // Ensure all sounds are stopped
+        key.isPlaying = false;
+        synths[key.id].triggerRelease(); // Ensure all sounds are stopped
     });
 
     playingKeys = []; // Clear the playing keys array
@@ -397,16 +418,18 @@ function processCurrentFrame() {
     const videoCanvas = document.getElementById('videoCanvas');
     const ctxVideo = videoCanvas.getContext('2d');
     ctxVideo.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
+    
     try {
+        if (!transformMatrix || !backgroundFrame) {
+            console.warn('Missing transform matrix or background frame');
+            return;
+        }
+        
         // Process the frame using OpenCV.js
         const currentFrame = cv.imread(videoCanvas);
         
-        const warped = new cv.Mat();
-        cv.warpPerspective(currentFrame, warped, transformMatrix, new cv.Size(cameraDimX, cameraDimY));
-
-        // Use background subtraction to detect movement
-        // Use warped instead of currentFrame
-        const movementMask = backgroundSubtraction(warped);
+        // Use background subtraction with the original frame
+        const movementMask = backgroundSubtraction(currentFrame);
         
         // Show the movement mask on process canvas
         cv.imshow('processCanvas', movementMask);
@@ -427,50 +450,60 @@ function processCurrentFrame() {
         console.error('Frame processing error:', error);
     }
 }
-// Background subtraction algorithm corrected for perspective and corner detection.
+
+// Background subtraction algorithm corrected for perspective transform
 function backgroundSubtraction(currentFrame) {
-    if (!transformMatrix || !backgroundFrame) {
-        console.warn('Transform matrix or background frame missing');
-        return new cv.Mat(); // Return empty
+    if (!backgroundFrame || !transformMatrix) {
+        console.warn('Background frame or transform matrix missing');
+        return new cv.Mat();
     }
 
-    // 1. Warp both frames to top-down view
-    const warpedCurrent = new cv.Mat();
-    const warpedBackground = new cv.Mat();
-    const warpSize = new cv.Size(1280, 720); // Or your piano area resolution
-
-    cv.warpPerspective(currentFrame, warpedCurrent, transformMatrix, warpSize);
-    cv.warpPerspective(backgroundFrame, warpedBackground, transformMatrix, warpSize);
-
-    // 2. Convert to grayscale
+    // Create grayscale versions
     const grayCurrent = new cv.Mat();
     const grayBackground = new cv.Mat();
-    cv.cvtColor(warpedCurrent, grayCurrent, cv.COLOR_RGBA2GRAY);
-    cv.cvtColor(warpedBackground, grayBackground, cv.COLOR_RGBA2GRAY);
+    cv.cvtColor(currentFrame, grayCurrent, cv.COLOR_RGBA2GRAY);
+    cv.cvtColor(backgroundFrame, grayBackground, cv.COLOR_RGBA2GRAY);
 
-    // 3. Compute absolute difference
+    // Apply perspective transform to both
+    const warpedCurrent = new cv.Mat();
+    const warpedBackground = new cv.Mat();
+    const warpSize = new cv.Size(cameraDimX, cameraDimY);
+    
+    cv.warpPerspective(grayCurrent, warpedCurrent, transformMatrix, warpSize);
+    cv.warpPerspective(grayBackground, warpedBackground, transformMatrix, warpSize);
+
+    // Compute absolute difference
     const diffFrame = new cv.Mat();
-    cv.absdiff(grayCurrent, grayBackground, diffFrame);
+    cv.absdiff(warpedCurrent, warpedBackground, diffFrame);
 
-    // 4. Apply threshold to highlight motion
+    // Apply threshold to highlight motion
     const mask = new cv.Mat();
-    const thresholdValue = 40; // Adjust as needed
+    const thresholdValue = 30; // Lower threshold to detect more movement
     cv.threshold(diffFrame, mask, thresholdValue, 255, cv.THRESH_BINARY);
 
-    // 5. Optional: clean up noise with morphology
+    // Clean up noise with morphology
     const kernel = cv.Mat.ones(5, 5, cv.CV_8U);
     const processedMask = new cv.Mat();
+    
+    // First open (erode then dilate) to remove small noise
     cv.morphologyEx(mask, processedMask, cv.MORPH_OPEN, kernel);
-    cv.morphologyEx(processedMask, processedMask, cv.MORPH_CLOSE, kernel);
+    
+    // Then close (dilate then erode) to fill gaps
+    const finalMask = new cv.Mat();
+    cv.morphologyEx(processedMask, finalMask, cv.MORPH_CLOSE, kernel);
 
-    // 🧼 Cleanup
-    warpedCurrent.delete(); warpedBackground.delete();
-    grayCurrent.delete(); grayBackground.delete();
-    diffFrame.delete(); mask.delete(); kernel.delete();
+    // Clean up intermediate matrices
+    grayCurrent.delete(); 
+    grayBackground.delete();
+    warpedCurrent.delete(); 
+    warpedBackground.delete();
+    diffFrame.delete(); 
+    mask.delete(); 
+    processedMask.delete();
+    kernel.delete();
 
-    return processedMask;
+    return finalMask;
 }
-
 
 // Blob detection to find feet
 function detectBlobs(mask) {
@@ -483,31 +516,35 @@ function detectBlobs(mask) {
     const footPositions = [];
     
     // Minimum area to be considered a foot (to filter out noise)
-    const minFootArea = 300; // Adjust based on your setup
-    
-    // Get video canvas dimensions for normalization
-    const videoCanvas = document.getElementById('videoCanvas');
-    const videoWidth = videoCanvas.width;
-    const videoHeight = videoCanvas.height;
+    const minFootArea = 200; // Reduced from 300 to detect smaller movements
     
     // Process each contour
     for (let i = 0; i < contours.size(); i++) {
         const contour = contours.get(i);
         const area = cv.contourArea(contour);
+        
         if (area > minFootArea) {
-            const moments = cv.moments(contour);
-            if (moments.m00 > 0) {
-                const centerX = moments.m10 / moments.m00;
-                const centerY = moments.m01 / moments.m00;
-                footPositions.push({
-                    x: centerX / videoWidth,
-                    y: centerY / videoHeight
-                });
+            // Get bounding rectangle to examine proportions
+            const rect = cv.boundingRect(contour);
+            const aspectRatio = rect.width / rect.height;
+            
+            // Filter by aspect ratio if needed (foot-like shapes)
+            if (aspectRatio > 0.2 && aspectRatio < 5.0) {
+                const moments = cv.moments(contour);
+                if (moments.m00 > 0) {
+                    const centerX = moments.m10 / moments.m00;
+                    const centerY = moments.m01 / moments.m00;
+                    
+                    // Store normalized position (0-1)
+                    footPositions.push({
+                        x: centerX / mask.cols,
+                        y: centerY / mask.rows
+                    });
+                }
             }
         }
-        contour.delete(); // ✅ This is critical
+        contour.delete();
     }
-    
     
     // Clean up
     contours.delete();
@@ -523,16 +560,15 @@ function updateKeyStates(footPositions) {
     const canvasWidth = outputCanvas.width;
     const canvasHeight = outputCanvas.height;
     
-    // Reset all keys to inactive
-    pianoKeys.forEach(key => {
-        key.isActive = false;
-    });
-    
     const now = Date.now(); // Current time in ms
+    const activationThreshold = 300; // Key stays active for this many ms after detection
+    
+    // Track which keys are touched in this frame
+    const touchedKeysThisFrame = new Set();
 
     // Check each foot position against piano keys
     footPositions.forEach(foot => {
-        // Map normalized foot position to canvas coordinates
+        // Map foot position to canvas coordinates
         const mappedX = foot.x * canvasWidth;
         const mappedY = foot.y * canvasHeight;
         
@@ -541,29 +577,30 @@ function updateKeyStates(footPositions) {
             if (mappedX >= key.x && mappedX <= key.x + key.width &&
                 mappedY >= key.y && mappedY <= key.y + key.height) {
                 key.lastActiveTime = now;
+                touchedKeysThisFrame.add(key.id);
             }
         });
     });
     
-    // Play sounds for newly activated keys and stop sounds for deactivated keys
-    // Now decide which keys should play or stop
+    // Update each key's state
     pianoKeys.forEach(key => {
-        const timeSinceLastTouch = now - key.lastActiveTime;
+        const timeSinceLastTouch = now - (key.lastActiveTime || 0);
 
-        if (timeSinceLastTouch < 100) { // Still active within last 300ms
-            key.isActive = true;
-            if (!key.isPlaying) {
-                synths[key.id].triggerAttack(key.note);
-                key.isPlaying = true;
-                console.log(`Starting note: ${key.note}`);
-            }
-        } else {
-            key.isActive = false;
-            if (key.isPlaying) {
-                synths[key.id].triggerRelease();
-                key.isPlaying = false;
-                console.log(`Stopping note: ${key.note}`);
-            }
+        // Key is active if recently touched
+        const wasActive = key.isActive;
+        key.isActive = timeSinceLastTouch < activationThreshold;
+        
+        // Play sound for newly activated keys
+        if (!wasActive && key.isActive) {
+            synths[key.id].triggerAttack(key.note);
+            key.isPlaying = true;
+            console.log(`Starting note: ${key.note}`);
+        } 
+        // Stop sound for deactivated keys
+        else if (wasActive && !key.isActive) {
+            synths[key.id].triggerRelease();
+            key.isPlaying = false;
+            console.log(`Stopping note: ${key.note}`);
         }
     });
 }
