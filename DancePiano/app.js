@@ -6,6 +6,10 @@ let isProcessingActive = false;
 let pianoKeys = [];
 let synths = {};
 let cvReady = false;
+let cameraDimX = 1280;
+let cameraDimY = 720;
+let transformMatrix = null;  // Store globally
+
 
 // Status elements
 const statusText = document.getElementById('statusText');
@@ -35,8 +39,8 @@ async function setupCamera() {
         // Request camera access
         const stream = await navigator.mediaDevices.getUserMedia({
             'video': {
-                width: 1280,
-                height: 720,
+                width: cameraDimX,
+                height: cameraDimY,
                 frameRate: { ideal: 30, min: 15 }
             }
         });
@@ -154,28 +158,197 @@ function captureBackground() {
         alert('OpenCV is not ready yet. Please wait.');
         return;
     }
-    
+
     try {
-        // Get the video canvas and draw the current frame
         const videoCanvas = document.getElementById('videoCanvas');
         const ctx = videoCanvas.getContext('2d');
         ctx.drawImage(video, 0, 0, videoCanvas.width, videoCanvas.height);
-        
-        // Capture this frame as background
+
         backgroundFrame = cv.imread(videoCanvas);
-        
         isBackgroundCaptured = true;
-        statusText.textContent = 'Background Captured - Ready to Start';
-        
-        // Show a preview of the background
+        statusText.textContent = 'Background Captured - Detecting Corners...';
+
+        // 🔍 Detect white stickers as corners
+        const corners = findPianoSurfaceCorners(backgroundFrame);
+        if (corners.length !== 4) {
+            alert(`Detected ${corners.length} corners. Need exactly 4.`);
+            return;
+        }
+
+        // ✅ Sort corners (rough sorting TL, TR, BR, BL)
+        corners.sort((a, b) => a.y - b.y);
+        const top = corners.slice(0, 2).sort((a, b) => a.x - b.x);
+        const bottom = corners.slice(2, 4).sort((a, b) => a.x - b.x);
+        const orderedCorners = [top[0], top[1], bottom[1], bottom[0]];
+
+        // 🔁 Get perspective transform matrix
+        transformMatrix = computePerspectiveMatrix(orderedCorners);
+
+        statusText.textContent = 'Corners Detected - Perspective Ready';
         cv.imshow('processCanvas', backgroundFrame);
-        
-        console.log('Background captured');
+        console.log('Background captured and transform matrix computed');
+
     } catch (error) {
         console.error('Error capturing background:', error);
         statusText.textContent = 'Error capturing background';
     }
 }
+
+function computePerspectiveMatrix(cornerPoints) {
+    const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        cornerPoints[0].x, cornerPoints[0].y,
+        cornerPoints[1].x, cornerPoints[1].y,
+        cornerPoints[2].x, cornerPoints[2].y,
+        cornerPoints[3].x, cornerPoints[3].y,
+    ]);
+
+    const rectWidth = 1280;
+    const rectHeight = 720;
+    const dstPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        0, 0,
+        rectWidth, 0,
+        rectWidth, rectHeight,
+        0, rectHeight
+    ]);
+
+    const transformMatrix = cv.getPerspectiveTransform(srcPts, dstPts);
+    srcPts.delete(); dstPts.delete();
+    return transformMatrix;
+}
+
+// Find white corners in image
+function findWhiteCorners(frame) {
+    const gray = new cv.Mat();
+    cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+
+    const thresholded = new cv.Mat();
+    cv.threshold(gray, thresholded, 230, 255, cv.THRESH_BINARY);  // Bright white threshold
+
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(thresholded, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    const corners = [];
+
+    for (let i = 0; i < contours.size(); i++) {
+        const contour = contours.get(i);
+        const area = cv.contourArea(contour);
+        if (area > 80) {  // Filter small spots
+            const moments = cv.moments(contour);
+            if (moments.m00 !== 0) {
+                corners.push({
+                    x: moments.m10 / moments.m00,
+                    y: moments.m01 / moments.m00
+                });
+            }
+        }
+        contour.delete();
+    }
+
+    gray.delete(); thresholded.delete(); contours.delete(); hierarchy.delete();
+
+    return corners;
+}
+
+// Find Red and green corners in the image.
+function findColoredCorners_HSV(frame) {
+    const hsv = new cv.Mat();
+    cv.cvtColor(frame, hsv, cv.COLOR_RGBA2RGB);
+    cv.cvtColor(hsv, hsv, cv.COLOR_RGB2HSV);
+
+    const findColorCenters = (lowerHSV, upperHSV) => {
+        const mask = new cv.Mat();
+        cv.inRange(hsv, lowerHSV, upperHSV, mask);
+
+        const contours = new cv.MatVector();
+        const hierarchy = new cv.Mat();
+        cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        const centers = [];
+        for (let i = 0; i < contours.size(); i++) {
+            const area = cv.contourArea(contours.get(i));
+            if (area > 100) {
+                const m = cv.moments(contours.get(i));
+                if (m.m00 !== 0) {
+                    centers.push({ x: m.m10 / m.m00, y: m.m01 / m.m00 });
+                }
+            }
+        }
+
+        mask.delete(); contours.delete(); hierarchy.delete();
+        return centers;
+    };
+
+    // HSV ranges for red and green (adjust as needed)
+    const redLower = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [0, 100, 100, 0]);
+    const redUpper = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [10, 255, 255, 255]);
+    const greenLower = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [40, 50, 50, 0]);
+    const greenUpper = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [90, 255, 255, 255]);
+
+    const redCorners = findColorCenters(redLower, redUpper);
+    const greenCorners = findColorCenters(greenLower, greenUpper);
+
+    redLower.delete(); redUpper.delete(); greenLower.delete(); greenUpper.delete(); hsv.delete();
+
+    if (redCorners.length !== 2 || greenCorners.length !== 2) {
+        console.warn(`Expected 2 red and 2 green markers. Found ${redCorners.length} red, ${greenCorners.length} green.`);
+        return [];
+    }
+
+    // Sort each pair by x to ensure proper left/right
+    redCorners.sort((a, b) => a.x - b.x);   // TL, TR
+    greenCorners.sort((a, b) => a.x - b.x); // BL, BR
+
+    return [redCorners[0], redCorners[1], greenCorners[1], greenCorners[0]]; // TL, TR, BR, BL
+}
+
+//Find piano surface corners
+function findPianoSurfaceCorners(frame) {
+    const gray = new cv.Mat();
+    cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+
+    const thresholded = new cv.Mat();
+    cv.threshold(gray, thresholded, 200, 255, cv.THRESH_BINARY); // bright white threshold
+
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(thresholded, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    let maxArea = 0;
+    let maxContour = null;
+
+    for (let i = 0; i < contours.size(); i++) {
+        const contour = contours.get(i);
+        const area = cv.contourArea(contour);
+        if (area > maxArea) {
+            maxArea = area;
+            maxContour = contour;
+        }
+    }
+
+    let corners = [];
+    if (maxContour) {
+        const approx = new cv.Mat();
+        const epsilon = 0.02 * cv.arcLength(maxContour, true);
+        cv.approxPolyDP(maxContour, approx, epsilon, true);
+
+        if (approx.rows === 4) {
+            for (let i = 0; i < 4; i++) {
+                const point = approx.data32S.slice(i * 2, i * 2 + 2);
+                corners.push({ x: point[0], y: point[1] });
+            }
+        } else {
+            console.warn(`Expected 4 corners, got ${approx.rows}`);
+        }
+
+        approx.delete();
+    }
+
+    gray.delete(); thresholded.delete(); contours.delete(); hierarchy.delete();
+
+    return corners;
+}
+
 
 // Main processing loop variables
 let processingInterval;
@@ -228,8 +401,12 @@ function processCurrentFrame() {
         // Process the frame using OpenCV.js
         const currentFrame = cv.imread(videoCanvas);
         
+        const warped = new cv.Mat();
+        cv.warpPerspective(currentFrame, warped, transformMatrix, new cv.Size(cameraDimX, cameraDimY));
+
         // Use background subtraction to detect movement
-        const movementMask = backgroundSubtraction(currentFrame);
+        // Use warped instead of currentFrame
+        const movementMask = backgroundSubtraction(warped);
         
         // Show the movement mask on process canvas
         cv.imshow('processCanvas', movementMask);
@@ -250,39 +427,50 @@ function processCurrentFrame() {
         console.error('Frame processing error:', error);
     }
 }
-// Background subtraction algorithm
+// Background subtraction algorithm corrected for perspective and corner detection.
 function backgroundSubtraction(currentFrame) {
-    // Convert frames to grayscale for easier processing
+    if (!transformMatrix || !backgroundFrame) {
+        console.warn('Transform matrix or background frame missing');
+        return new cv.Mat(); // Return empty
+    }
+
+    // 1. Warp both frames to top-down view
+    const warpedCurrent = new cv.Mat();
+    const warpedBackground = new cv.Mat();
+    const warpSize = new cv.Size(1280, 720); // Or your piano area resolution
+
+    cv.warpPerspective(currentFrame, warpedCurrent, transformMatrix, warpSize);
+    cv.warpPerspective(backgroundFrame, warpedBackground, transformMatrix, warpSize);
+
+    // 2. Convert to grayscale
+    const grayCurrent = new cv.Mat();
     const grayBackground = new cv.Mat();
-    const grayCurrentFrame = new cv.Mat();
-    cv.cvtColor(backgroundFrame, grayBackground, cv.COLOR_RGBA2GRAY);
-    cv.cvtColor(currentFrame, grayCurrentFrame, cv.COLOR_RGBA2GRAY);
-    
-    // Calculate absolute difference between current frame and background
+    cv.cvtColor(warpedCurrent, grayCurrent, cv.COLOR_RGBA2GRAY);
+    cv.cvtColor(warpedBackground, grayBackground, cv.COLOR_RGBA2GRAY);
+
+    // 3. Compute absolute difference
     const diffFrame = new cv.Mat();
-    cv.absdiff(grayBackground, grayCurrentFrame, diffFrame);
-    
-    // Apply threshold to get binary mask of movement
-    const thresholdValue = 100; // Adjust based on lighting conditions
+    cv.absdiff(grayCurrent, grayBackground, diffFrame);
+
+    // 4. Apply threshold to highlight motion
     const mask = new cv.Mat();
+    const thresholdValue = 40; // Adjust as needed
     cv.threshold(diffFrame, mask, thresholdValue, 255, cv.THRESH_BINARY);
-    
-    // Apply morphological operations to remove noise
+
+    // 5. Optional: clean up noise with morphology
     const kernel = cv.Mat.ones(5, 5, cv.CV_8U);
     const processedMask = new cv.Mat();
-    
-    // Dilate to fill in holes
-    cv.dilate(mask, processedMask, kernel);
-    
-    // Clean up
-    grayBackground.delete();
-    grayCurrentFrame.delete();
-    diffFrame.delete();
-    mask.delete();
-    kernel.delete();
-    
+    cv.morphologyEx(mask, processedMask, cv.MORPH_OPEN, kernel);
+    cv.morphologyEx(processedMask, processedMask, cv.MORPH_CLOSE, kernel);
+
+    // 🧼 Cleanup
+    warpedCurrent.delete(); warpedBackground.delete();
+    grayCurrent.delete(); grayBackground.delete();
+    diffFrame.delete(); mask.delete(); kernel.delete();
+
     return processedMask;
 }
+
 
 // Blob detection to find feet
 function detectBlobs(mask) {
