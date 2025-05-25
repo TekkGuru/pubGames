@@ -3,49 +3,179 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Interactive Floor Piano</title>
-    <link rel="stylesheet" href="style.css">
-    <!-- Include OpenCV.js -->
-    <script async src="https://docs.opencv.org/4.5.5/opencv.js" onload="onOpenCVReady();" type="text/javascript"></script>
-    <!-- Include Tone.js for audio -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <title>Interactive Floor Piano Projection</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #222;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            width: 100%;
+            max-width: 1280px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        .controls {
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        button {
+            padding: 10px 15px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        #statusText {
+            margin: 10px 0;
+            font-size: 18px;
+            color: #FFC107;
+        }
+        .canvas-container {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 20px;
+            width: 100%;
+        }
+        .canvas-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        canvas {
+            border: 1px solid #555;
+            max-width: 100%;
+            height: auto;
+        }
+        #video {
+            display: none; /* Hide the video element */
+        }
+        .projection-mode {
+            padding: 10px;
+            margin: 10px 0;
+            background-color: #333;
+            border-radius: 5px;
+        }
+        .fullscreen-button {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(0,0,0,0.5);
+            color: white;
+            z-index: 100;
+        }
+        /* For projection mode */
+        .projection-view {
+            position: relative;
+        }
+        /* When in projection mode, maximize the canvas */
+        .projection-active #outputCanvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw !important;
+            height: 100vh !important;
+            z-index: 1000;
+            max-width: none;
+            object-fit: contain;
+            background-color: black;
+            border: none;
+        }
+    </style>
 </head>
 <body>
     <div class="container">
-        <h1>Interactive Floor Piano</h1>
+        <h1>Interactive Floor Piano Projection</h1>
+        <p id="statusText">Loading OpenCV...</p>
         
         <div class="controls">
             <button id="captureBackground">Capture Background</button>
+            <button id="calibrateColors">Calibrate Colors</button>
             <button id="startPiano">Start Piano</button>
-            <div class="status">Status: <span id="statusText">Waiting for OpenCV...</span></div>
+            <button id="toggleProjection">Enter Projection Mode</button>
         </div>
         
-        <div class="video-section">
-            <!-- Video element (hidden, just used for capture) -->
-            <video id="video" autoplay playsinline muted></video>
-            
-            <!-- Canvas elements for processing -->
-            <div class="canvas-container">
-                <div class="canvas-wrapper">
-                    <h3>Camera Feed</h3>
-                    <canvas id="videoCanvas" width="1280" height="720"></canvas>
-                </div>
-                <div class="canvas-wrapper">
-                    <h3>Motion Detection</h3>
-                    <canvas id="processCanvas" width="1280" height="720"></canvas>
-                </div>
+        <div class="canvas-container">
+            <div class="canvas-box">
+                <h3>Camera View</h3>
+                <canvas id="videoCanvas"></canvas>
             </div>
-        </div>
-        
-        <div class="piano-section">
-            <h2>Floor Piano</h2>
-            <div class="canvas-wrapper piano-wrapper">
-                <canvas id="outputCanvas" width="800" height="400"></canvas>
+            <div class="canvas-box">
+                <h3>Processing View</h3>
+                <canvas id="processCanvas"></canvas>
+            </div>
+            <div class="canvas-box projection-view">
+                <h3>Piano Projection</h3>
+                <canvas id="outputCanvas"></canvas>
+                <button id="fullscreenButton" class="fullscreen-button">⛶</button>
             </div>
         </div>
     </div>
-
-    <!-- Main JavaScript file -->
+    
+    <!-- Hidden video element for camera capture -->
+    <video id="video" autoplay muted playsinline></video>
+    
+    <!-- Load libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.min.js"></script>
+    
+    <!-- Main application script - load this BEFORE OpenCV.js -->
     <script src="app.js"></script>
+    
+    <!-- Load OpenCV after app.js is loaded so onOpenCVReady is defined -->
+    <script src="https://docs.opencv.org/4.7.0/opencv.js" onload="onOpenCVReady()"></script>
+    
+    <script>
+        // Toggle projection mode
+        document.getElementById('toggleProjection').addEventListener('click', function() {
+            const container = document.body;
+            if (container.classList.contains('projection-active')) {
+                container.classList.remove('projection-active');
+                this.textContent = 'Enter Projection Mode';
+            } else {
+                container.classList.add('projection-active');
+                this.textContent = 'Exit Projection Mode';
+            }
+        });
+        
+        // Fullscreen button for the output canvas
+        document.getElementById('fullscreenButton').addEventListener('click', function() {
+            const outputCanvas = document.getElementById('outputCanvas');
+            if (outputCanvas.requestFullscreen) {
+                outputCanvas.requestFullscreen();
+            } else if (outputCanvas.webkitRequestFullscreen) {
+                outputCanvas.webkitRequestFullscreen();
+            } else if (outputCanvas.msRequestFullscreen) {
+                outputCanvas.msRequestFullscreen();
+            }
+        });
+
+        document.addEventListener("keydown", function(event) {
+            // Check for Ctrl + B
+            if (event.ctrlKey && event.key === "b") {
+            event.preventDefault(); // Prevent browser default behavior
+            document.getElementById("captureBackground").click();
+            }
+        });
+    </script>
+    
+    <!-- Main application script is now loaded above -->
 </body>
 </html>
