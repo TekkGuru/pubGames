@@ -1,4 +1,5 @@
 
+
 // Global variables
 let video; // Will store the HTMLVideoElement
 let backgroundFrame; // Unwarped background frame from camera
@@ -115,7 +116,17 @@ async function setupCamera() {
 
 // Define piano keys layout
 function setupPianoKeys() {
-    const keyColors = ['#FF3366', '#FF9500', '#FFCC00', '#33CC33', '#3399FF', '#6633CC', '#CC33FF', '#FF33CC'];
+    // New color palette: Yellows, Oranges, Greens
+    const keyColors = [
+        '#FFD700', // Gold (Yellow)
+        '#FFA500', // Orange
+        '#32CD32', // LimeGreen
+        '#FFD700', // Gold (Yellow)
+        '#FFA500', // Orange
+        '#32CD32', // LimeGreen
+        '#FFD700', // Gold (Yellow)
+        '#FFA500'  // Orange
+    ];
     const noteNames = ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C'];
     const notes = ['C4', 'D4', 'E4', 'F4', 'G4', 'A4', 'B4', 'C5'];
     
@@ -146,7 +157,7 @@ function setupPianoKeys() {
         });
     }
     drawPianoKeys();
-    console.log("setupPianoKeys: Piano keys configured.");
+    console.log("setupPianoKeys: Piano keys configured with new color palette.");
 }
 
 // Helper function to convert hex color to approximate HSV range
@@ -169,9 +180,22 @@ function getHSVRangeForColor(hexColor) {
     
     s = max === 0 ? 0 : delta / max;
     
+    // Adjust HSV range detection parameters: more sensitive Saturation and Value, wider Hue range
+    const hueRange = 20; // Wider hue tolerance
+    const saturationRange = 70; // Wider saturation tolerance
+    const valueRange = 70; // Wider value tolerance
+    
     return {
-        lower: [Math.max(0, Math.round(h / 2) - 10), Math.max(0, Math.round(s * 255) - 50), Math.max(0, Math.round(v * 255) - 50)],
-        upper: [Math.min(179, Math.round(h / 2) + 10), Math.min(255, Math.round(s * 255) + 50), Math.min(255, Math.round(v * 255) + 50)]
+        lower: [
+            Math.max(0, Math.round(h / 2) - hueRange), 
+            Math.max(0, Math.round(s * 255) - saturationRange), 
+            Math.max(0, Math.round(v * 255) - valueRange)
+        ],
+        upper: [
+            Math.min(179, Math.round(h / 2) + hueRange), 
+            Math.min(255, Math.round(s * 255) + saturationRange), 
+            Math.min(255, Math.round(v * 255) + valueRange)
+        ]
     };
 }
 
@@ -426,16 +450,21 @@ function calibrateColorDetection() {
             const roi = hsv.roi(roiRect);
             const meanHsv = cv.mean(roi); 
             
+            // Fine-tune HSV ranges during calibration
+            const hueCalibRange = 15; // More precise hue for calibration
+            const satCalibRange = 50; // Keep saturation/value broader for lighting variations
+            const valCalibRange = 50;
+
             key.hsv = {
                 lower: [
-                    Math.max(0, Math.round(meanHsv[0]) - 15), 
-                    Math.max(0, Math.round(meanHsv[1]) - 60), 
-                    Math.max(0, Math.round(meanHsv[2]) - 60)  
+                    Math.max(0, Math.round(meanHsv[0]) - hueCalibRange), 
+                    Math.max(0, Math.round(meanHsv[1]) - satCalibRange), 
+                    Math.max(0, Math.round(meanHsv[2]) - valCalibRange)  
                 ],
                 upper: [
-                    Math.min(179, Math.round(meanHsv[0]) + 15),
-                    Math.min(255, Math.round(meanHsv[1]) + 60),
-                    Math.min(255, Math.round(meanHsv[2]) + 60)
+                    Math.min(179, Math.round(meanHsv[0]) + hueCalibRange),
+                    Math.min(255, Math.round(meanHsv[1]) + satCalibRange),
+                    Math.min(255, Math.round(meanHsv[2]) + valCalibRange)
                 ]
             };
             console.log(`Key ${index} (${key.noteName}) calibrated HSV: L=[${key.hsv.lower.map(v=>v.toFixed(0)).join(',')}] U=[${key.hsv.upper.map(v=>v.toFixed(0)).join(',')}] from Mean=[${meanHsv.map(v=>v.toFixed(0)).join(',')}]`);
@@ -466,11 +495,23 @@ function startProcessing() {
         alert("Warped background frame not ready. Capture background and ensure corners are detected.");
         return;
     }
-    if (pianoKeys.some(key => key.hsv.lower.join(',') === getHSVRangeForColor(key.color).lower.join(','))) {
-        if (!confirm("Colors might not be calibrated for the current lighting. Continue anyway?")) {
+    
+    // Check if default HSV values are still present, suggesting calibration might be needed.
+    let needsCalibrationWarning = false;
+    for (const key of pianoKeys) {
+        const defaultHsv = getHSVRangeForColor(key.color);
+        if (key.hsv.lower.join(',') === defaultHsv.lower.join(',') && 
+            key.hsv.upper.join(',') === defaultHsv.upper.join(',')) {
+            needsCalibrationWarning = true;
+            break;
+        }
+    }
+    if (needsCalibrationWarning) {
+        if (!confirm("Colors might not be optimally calibrated for the current lighting. Performance may vary. Continue anyway?")) {
             return;
         }
     }
+
 
     isProcessingActive = true;
     processingInterval = setInterval(() => {
@@ -545,7 +586,7 @@ function detectActivePianoRegions(warpedCurrentFrame) {
     cv.cvtColor(hsvCurrent, hsvCurrent, cv.COLOR_RGB2HSV);
 
     const activeRegions = [];
-    const occlusionThreshold = 0.75; 
+    const occlusionThreshold = 0.5; 
 
     pianoKeys.forEach(key => {
         const keyROI_Rect = new cv.Rect(
@@ -699,4 +740,3 @@ function stopSound(keyId) {
 // This ensures OpenCV is fully loaded and the DOM is more likely
 // to be ready before onOpenCVReady is executed.
 console.log("app.js loaded. Waiting for OpenCV to trigger onOpenCVReady().");
-
