@@ -1,0 +1,16 @@
+Spline points : 100
+Ejection Fraction (EF): 69.17 %
+Peak Global Longitudinal Strain (GLS): -25.29 %
+End-Diastolic Volume (EDV): 0.77 ml
+End-Systolic Volume (ESV): 0.24 ml
+
+
+
+Spline points: 65
+Ejection Fraction (EF): 68.49 %
+Peak Global Longitudinal Strain (GLS): -25.29 %
+End-Diastolic Volume (EDV): 0.72 ml
+End-Systolic Volume (ESV): 0.23 ml
+
+
+It seems the GLS does not change based on the spline points.
