@@ -6,32 +6,34 @@ from scipy.interpolate import splprep, splev
 
 class CardiacAnalyzer:
     """
-    Corrected version of the LV analysis script. This version implements a fixed-apex
-    strategy and includes a more robust XML parser and a corrected volume calculation.
+    Advanced version of the LV analysis script. This version includes endocardial and
+    epicardial GLS, strain rate, segmental strain analysis, and bulls-eye plotting.
     """
 
-    def __init__(self, xml_file_path: str, smoothing_factor: float = 20.0, num_points: int = 49):
+    def __init__(self, xml_file_path: str, smoothing_factor: float = 20.0, num_points: int = 130):
         self.xml_path = xml_file_path
         self.smoothing_factor = smoothing_factor
         self.num_points = num_points
         self._parse_xml_data()
+        
+        # Endo data
         self.resampled_contours = []
         self.volumes_ml = np.array([])
         self.gls_curve = np.array([])
-        # This will store the apex index from the reference frame (frame 0).
-        self.apex_index_ref = None
-        # Attributes for visualization of segment lengths
-        self.total_lengths_mm = None
-        self.all_segment_lengths_mm = None
-        self.min_len_frame_idx = None
-        self.max_len_frame_idx = None
+        self.strain_rate_curve = np.array([])
+        self.segmental_strain_results = {}
 
+        # Epi data
+        self.resampled_epi_contours = []
+        self.epi_gls_curve = np.array([])
+
+        self.apex_index_ref = None
+        self.min_len_frame_idx = None
+        self.max_len_frame_idx = 0
 
     def _parse_xml_data(self):
         """
-        Parses the SpreadsheetML XML file.
-        **FIX**: Added robustness to handle potentially ragged data arrays coming
-        from Excel by determining a consistent number of frames.
+        Parses the SpreadsheetML XML file for both Endo and Epi contours.
         """
         ns = {'ss': 'urn:schemas-microsoft-com:office:spreadsheet'}
         try:
@@ -40,113 +42,93 @@ class CardiacAnalyzer:
         except ET.ParseError as e:
             raise ValueError(f"Error parsing XML file: {e}")
         all_rows = root.findall('.//ss:Worksheet/ss:Table/ss:Row', ns)
-        time_intervals_ms, x_coords_by_point, y_coords_by_point = [], [], []
+        
+        time_intervals_ms, endo_x, endo_y, epi_x, epi_y = [], [], [], [], []
         parsing_state = None
+
         for row in all_rows:
             cells = row.findall('ss:Cell', ns)
             if not cells: continue
             first_cell_data_element = cells[0].find('ss:Data', ns)
+            
             if first_cell_data_element is not None and first_cell_data_element.text:
                 header = first_cell_data_element.text.strip()
                 if header == 'frametime':
                     time_intervals_ms = [float(c.find('ss:Data', ns).text) for c in cells[1:] if c.find('ss:Data', ns) is not None]
                 elif header == 'pixelsize':
                     self.pixel_size_mm = float(cells[1].find('ss:Data', ns).text)
-                elif header in ['EndoX', 'EndoY', 'EpiX']:
+                elif header in ['EndoX', 'EndoY', 'EpiX', 'EpiY']:
                     parsing_state = header
                     continue
             
-            if parsing_state in ['EndoX', 'EndoY']:
+            if parsing_state:
                 numeric_cells = [c.find('ss:Data', ns) for c in cells if c.find('ss:Data', ns) is not None and c.find('ss:Data', ns).get(f'{{{ns["ss"]}}}Type') == 'Number']
                 if not numeric_cells: continue
-                
                 row_values = [float(c.text) for c in numeric_cells]
                 
-                if parsing_state == 'EndoX':
-                    x_coords_by_point.append(row_values)
-                elif parsing_state == 'EndoY':
-                    y_coords_by_point.append(row_values)
+                if parsing_state == 'EndoX': endo_x.append(row_values)
+                elif parsing_state == 'EndoY': endo_y.append(row_values)
+                elif parsing_state == 'EpiX': epi_x.append(row_values)
+                elif parsing_state == 'EpiY': epi_y.append(row_values)
 
-        if not time_intervals_ms or not x_coords_by_point or not y_coords_by_point:
-            raise ValueError("Could not find required data (frametime, EndoX, EndoY) in XML.")
-        
-        num_frames = min(len(row) for row in x_coords_by_point)
-        print(f"Detected a consistent number of {num_frames} frames.")
+        if not all([time_intervals_ms, endo_x, endo_y, epi_x, epi_y]):
+            raise ValueError("Could not find required data (frametime, EndoX/Y, EpiX/Y) in XML.")
 
-        x_coords_trimmed = [row[:num_frames] for row in x_coords_by_point]
-        y_coords_trimmed = [row[:num_frames] for row in y_coords_by_point]
+        # Process Endo and Epi contours
+        self.raw_contours, self.times_sec = self._process_raw_contours(endo_x, endo_y, time_intervals_ms)
+        self.raw_epi_contours, _ = self._process_raw_contours(epi_x, epi_y, time_intervals_ms)
 
-        x_coords_by_frame = np.array(x_coords_trimmed).T
-        y_coords_by_frame = np.array(y_coords_trimmed).T
-
-        self.raw_contours = [np.column_stack((x, y)) for x, y in zip(x_coords_by_frame, y_coords_by_frame)]
-        self.times_sec = np.cumsum([0] + time_intervals_ms[:num_frames-1]) / 1000.0
+    def _process_raw_contours(self, x_coords, y_coords, times):
+        """Helper to process raw coordinate lists into contours."""
+        num_frames = min(len(row) for row in x_coords)
+        x_trimmed = [row[:num_frames] for row in x_coords]
+        y_trimmed = [row[:num_frames] for row in y_coords]
+        x_by_frame = np.array(x_trimmed).T
+        y_by_frame = np.array(y_trimmed).T
+        contours = [np.column_stack((x, y)) for x, y in zip(x_by_frame, y_by_frame)]
+        times_sec = np.cumsum([0] + times[:num_frames-1]) / 1000.0
+        return contours, times_sec
 
     def _find_apex_index(self, contour: np.ndarray) -> int:
-        """
-        Determines the apex as the point on the contour farthest from the
-        center of the two mitral valve endpoints.
-        """
-        if len(contour) < 2:
-            return 0
+        if len(contour) < 2: return 0
         mitral_p1, mitral_p_end = contour[0], contour[-1]
         base_center = (mitral_p1 + mitral_p_end) / 2.0
         distances = np.linalg.norm(contour - base_center, axis=1)
         return np.argmax(distances)
 
     def _determine_and_validate_apex_on_ref_frame(self):
-        """
-        Determines and validates the apex on the reference frame (frame 0).
-        """
-        if not self.raw_contours:
-            raise ValueError("Raw contours not loaded. Cannot determine apex.")
-        
+        if not self.raw_contours: raise ValueError("Endo contours not loaded.")
         ref_contour = self.raw_contours[0]
         apex_idx = self._find_apex_index(ref_contour)
-
         if apex_idx == 0 or apex_idx == len(ref_contour) - 1:
-            raise ValueError(
-                "Apex detected as an endpoint on the reference frame. "
-                "Cannot perform stable two-segment analysis. Please check input data."
-            )
+            raise ValueError("Apex detected as an endpoint on the reference frame.")
         self.apex_index_ref = apex_idx
         print(f"Reference apex index set to: {self.apex_index_ref}")
 
-    def _resample_contours(self):
-        """
-        Implements a fixed-apex "Anchor-and-Smooth" strategy.
-        """
-        self.resampled_contours = []
+    def _resample_all_contours(self):
+        print("Resampling Endocardial contours...")
+        self.resampled_contours, self.n_pts_wall1, self.n_pts_wall2 = self._perform_resampling(self.raw_contours)
+        print("Resampling Epicardial contours...")
+        self.resampled_epi_contours, _, _ = self._perform_resampling(self.raw_epi_contours)
 
-        def get_spline_and_length(segment_pts, smoothing_factor):
-            n_pts = len(segment_pts)
-            if n_pts < 2: return None, 0.0
-            k = min(3, n_pts - 1)
-            s = smoothing_factor if k >= 3 else 0
-            try:
-                tck, _ = splprep([segment_pts[:, 0], segment_pts[:, 1]], s=s, k=k, per=False)
-                u_fine = np.linspace(0, 1, 200)
-                points_fine = np.column_stack(splev(u_fine, tck))
-                length = np.sum(np.linalg.norm(np.diff(points_fine, axis=0), axis=1))
-                return tck, length
-            except Exception as e:
-                print(f"Warning: Spline generation failed for a segment. {e}")
-                return None, 0.0
-
-        for raw_contour in self.raw_contours:
+    def _perform_resampling(self, raw_contours_list):
+        resampled_list = []
+        n_pts1_ref, n_pts2_ref = 0, 0
+        
+        for i, raw_contour in enumerate(raw_contours_list):
             apex_idx = self.apex_index_ref
             seg1_pts = raw_contour[:apex_idx + 1]
             seg2_pts = raw_contour[apex_idx:]
 
-            tck1, len1 = get_spline_and_length(seg1_pts, self.smoothing_factor)
-            tck2, len2 = get_spline_and_length(seg2_pts, self.smoothing_factor)
+            tck1, len1 = self._get_spline_and_length(seg1_pts)
+            tck2, len2 = self._get_spline_and_length(seg2_pts)
 
             if tck1 is None or tck2 is None:
-                self.resampled_contours.append(np.array([])); continue
+                resampled_list.append(np.array([])); continue
             
             total_len = len1 + len2
             if total_len <= 1e-9:
-                self.resampled_contours.append(np.array([])); continue
+                resampled_list.append(np.array([])); continue
                 
             num_spline_points = self.num_points + 1
             n_pts1 = int(round(num_spline_points * len1 / total_len))
@@ -155,279 +137,273 @@ class CardiacAnalyzer:
             if n_pts1 < 2: n_pts1 = 2; n_pts2 = num_spline_points - 2
             if n_pts2 < 2: n_pts2 = 2; n_pts1 = num_spline_points - 2
             if n_pts1 < 2 or n_pts2 < 2:
-                self.resampled_contours.append(np.array([])); continue
+                resampled_list.append(np.array([])); continue
+            
+            if i == 0: n_pts1_ref, n_pts2_ref = n_pts1, n_pts2
 
-            u1_new = np.linspace(0, 1, n_pts1)
-            u2_new = np.linspace(0, 1, n_pts2)
+            u1_new = np.linspace(0, 1, n_pts1); u2_new = np.linspace(0, 1, n_pts2)
             seg1_new = np.column_stack(splev(u1_new, tck1))
             seg2_new = np.column_stack(splev(u2_new, tck2))
             
             final_contour = np.vstack([seg1_new[:-1], seg2_new])
-            self.resampled_contours.append(final_contour)
+            resampled_list.append(final_contour)
+            
+        return resampled_list, n_pts1_ref, n_pts2_ref
 
-    def _calculate_all_lengths(self):
-        """
-        Calculates total and segmental lengths for all contours and finds the
-        min and max length frames for visualization.
-        """
-        if not self.resampled_contours:
-            raise RuntimeError("Resampling must be done before calculating lengths.")
-
-        self.total_lengths_mm = []
-        self.all_segment_lengths_mm = []
-
-        for contour in self.resampled_contours:
+    def _get_spline_and_length(self, segment_pts):
+        n_pts = len(segment_pts)
+        if n_pts < 2: return None, 0.0
+        k = min(3, n_pts - 1)
+        s = self.smoothing_factor if k >= 3 else 0
+        try:
+            tck, _ = splprep([segment_pts[:, 0], segment_pts[:, 1]], s=s, k=k, per=False)
+            u_fine = np.linspace(0, 1, 200)
+            points_fine = np.column_stack(splev(u_fine, tck))
+            length = np.sum(np.linalg.norm(np.diff(points_fine, axis=0), axis=1))
+            return tck, length
+        except Exception: return None, 0.0
+    
+    def _calculate_all_lengths(self, contours_list):
+        total_lengths = []
+        all_segment_lengths = []
+        for contour in contours_list:
             if contour.shape[0] < 2:
-                self.total_lengths_mm.append(0)
-                self.all_segment_lengths_mm.append(np.array([]))
+                total_lengths.append(0); all_segment_lengths.append(np.array([]))
                 continue
-
             contour_mm = contour * self.pixel_size_mm
             segment_lengths = np.linalg.norm(np.diff(contour_mm, axis=0), axis=1)
-            self.all_segment_lengths_mm.append(segment_lengths)
-            self.total_lengths_mm.append(np.sum(segment_lengths))
-
-        self.total_lengths_mm = np.array(self.total_lengths_mm)
-        if len(self.total_lengths_mm) > 0:
-            self.min_len_frame_idx = np.argmin(self.total_lengths_mm)
-            self.max_len_frame_idx = 0  # Assuming frame 0 is End-Diastole (max length)
-            print(f"Max length frame (ED): {self.max_len_frame_idx}, Min length frame (ES): {self.min_len_frame_idx}")
-
+            all_segment_lengths.append(segment_lengths)
+            total_lengths.append(np.sum(segment_lengths))
+        return np.array(total_lengths), all_segment_lengths
 
     def _calculate_volumes(self):
-        """
-        Calculates volume using method of disks, PARALLEL to the mitral base.
-        """
         self.volumes_ml = np.zeros(len(self.resampled_contours))
         for i, contour in enumerate(self.resampled_contours):
             if contour.shape[0] < 3: continue
-
             raw_contour = self.raw_contours[i]
             mitral_p1, mitral_p_end = raw_contour[0], raw_contour[-1]
             base_vector = mitral_p_end - mitral_p1
-
             if np.linalg.norm(base_vector) == 0: continue
-
             angle = np.arctan2(base_vector[1], base_vector[0])
             c, s = np.cos(angle), np.sin(angle)
             rot_mat = np.array([[c, s], [-s, c]])
             oriented_contour = np.dot(rot_mat, (contour - mitral_p1).T).T
-
             y_coords = oriented_contour[:, 1]
             if np.max(y_coords) - np.min(y_coords) <= 1e-6: continue
-
             total_volume = 0.0
             sorted_points = oriented_contour[np.argsort(y_coords)]
-
             for j in range(len(sorted_points) - 1):
                 y1, y2 = sorted_points[j, 1], sorted_points[j+1, 1]
                 disk_height = y2 - y1
-
                 if disk_height <= 0: continue
-                
                 slice_points = oriented_contour[(oriented_contour[:, 1] >= y1) & (oriented_contour[:, 1] <= y2)]
-
                 if len(slice_points) < 2: continue
-                
                 radius = (np.max(slice_points[:, 0]) - np.min(slice_points[:, 0])) / 2.0
                 total_volume += np.pi * (radius**2) * disk_height
-
             self.volumes_ml[i] = total_volume * (self.pixel_size_mm**3) / 1000.0
+        
+        self.min_vol_frame_idx = np.argmin(self.volumes_ml) if len(self.volumes_ml) > 0 else 0
 
     def _calculate_gls(self):
-        """
-        Calculates Global Longitudinal Strain (GLS) using pre-calculated total lengths.
-        """
-        if self.total_lengths_mm is None or len(self.total_lengths_mm) == 0:
-            self.gls_curve = np.zeros(len(self.resampled_contours))
-            return
+        self.total_lengths_mm, self.all_segment_lengths_mm = self._calculate_all_lengths(self.resampled_contours)
+        self.min_len_frame_idx = np.argmin(self.total_lengths_mm) if len(self.total_lengths_mm) > 0 else 0
+        ref_length = self.total_lengths_mm[self.max_len_frame_idx]
+        if ref_length > 1e-9:
+            self.gls_curve = (self.total_lengths_mm - ref_length) / ref_length * 100.0
 
-        ref_total_length = self.total_lengths_mm[self.max_len_frame_idx]
+        epi_total_lengths, _ = self._calculate_all_lengths(self.resampled_epi_contours)
+        ref_epi_length = epi_total_lengths[self.max_len_frame_idx]
+        if ref_epi_length > 1e-9:
+            self.epi_gls_curve = (epi_total_lengths - ref_epi_length) / ref_epi_length * 100.0
 
-        if ref_total_length < 1e-9:
-            self.gls_curve = np.zeros(len(self.resampled_contours))
-            return
-            
-        gls_values = []
-        for curr_total_length in self.total_lengths_mm:
-            strain = (curr_total_length - ref_total_length) / ref_total_length
-            gls_values.append(strain * 100.0)
-            
-        self.gls_curve = np.array(gls_values)
+    def _calculate_strain_rate(self):
+        if len(self.gls_curve) > 1 and len(self.times_sec) == len(self.gls_curve):
+            self.strain_rate_curve = np.gradient(self.gls_curve, self.times_sec)
+    
+    def _calculate_segmental_strain(self):
+        ref_lengths = self.all_segment_lengths_mm[self.max_len_frame_idx]
+        systolic_lengths = self.all_segment_lengths_mm[self.min_len_frame_idx]
+
+        if len(ref_lengths) != len(systolic_lengths): return
+        
+        strains = (systolic_lengths - ref_lengths) / ref_lengths * 100.0
+        
+        num_segs_wall1 = self.n_pts_wall1 - 1
+        basal1_end = num_segs_wall1 // 3
+        mid1_end = basal1_end * 2
+        
+        num_segs_wall2 = self.n_pts_wall2 - 1
+        basal2_start = num_segs_wall1 + num_segs_wall2 - (num_segs_wall2 // 3)
+        mid2_start = basal2_start - (num_segs_wall2 // 3)
+
+        self.segmental_strain_results = {
+            'Basal Septal': np.mean(strains[:basal1_end]),
+            'Mid Septal': np.mean(strains[basal1_end:mid1_end]),
+            'Apical Septal': np.mean(strains[mid1_end:num_segs_wall1-1]),
+            'Apical Cap': strains[num_segs_wall1-1],
+            'Apical Lateral': np.mean(strains[num_segs_wall1:mid2_start]),
+            'Mid Lateral': np.mean(strains[mid2_start:basal2_start]),
+            'Basal Lateral': np.mean(strains[basal2_start:])
+        }
 
     def _calculate_ef(self):
-        """Calculates Ejection Fraction from the volume curve."""
         if len(self.volumes_ml) == 0 or np.max(self.volumes_ml) == 0: return 0.0
-        edv = np.max(self.volumes_ml)
-        esv = np.min(self.volumes_ml)
-        return ((edv - esv) / edv) * 100.0
+        edv = self.volumes_ml[self.max_len_frame_idx]
+        esv = self.volumes_ml[self.min_vol_frame_idx]
+        return ((edv - esv) / edv) * 100.0 if edv > 0 else 0.0
         
     def analyze(self) -> Dict[str, Any]:
         """Runs the full, corrected analysis pipeline."""
-        print("Step 1: Determining and validating apex on reference frame...")
+        print("Step 1: Determining apex...")
         self._determine_and_validate_apex_on_ref_frame()
-        print(f"Step 2: Resampling all contours with fixed-apex method (s={self.smoothing_factor})...")
-        self._resample_contours()
-        print("Step 3: Calculating all contour lengths for GLS and visualization...")
-        self._calculate_all_lengths()
-        print("Step 4: Calculating volume curve with corrected orientation...")
+        print("Step 2: Resampling contours...")
+        self._resample_all_contours()
+        print("Step 3: Calculating volumes...")
         self._calculate_volumes()
-        print("Step 5: Calculating Ejection Fraction...")
-        ef = self._calculate_ef()
-        print("Step 6: Calculating Global Longitudinal Strain from total contour length...")
+        print("Step 4: Calculating GLS (Endo & Epi)...")
         self._calculate_gls()
+        print("Step 5: Calculating Strain Rate...")
+        self._calculate_strain_rate()
+        print("Step 6: Calculating Segmental Strain...")
+        self._calculate_segmental_strain()
+        print("Step 7: Calculating Ejection Fraction...")
+        ef = self._calculate_ef()
         print("\nAnalysis Complete.")
         
         results = {
             'ejection_fraction': ef,
-            'peak_global_longitudinal_strain': 0.0,
-            'end_diastolic_volume_ml': 0.0,
-            'end_systolic_volume_ml': 0.0,
-            'time_seconds': self.times_sec,
-            'volume_ml_curve': self.volumes_ml,
-            'gls_percent_curve': self.gls_curve
+            'peak_global_longitudinal_strain': np.min(self.gls_curve) if len(self.gls_curve) > 0 else 0,
+            'peak_epi_gls': np.min(self.epi_gls_curve) if len(self.epi_gls_curve) > 0 else 0,
+            'peak_strain_rate': np.min(self.strain_rate_curve) if len(self.strain_rate_curve) > 0 else 0,
+            'end_diastolic_volume_ml': self.volumes_ml[self.max_len_frame_idx] if len(self.volumes_ml) > 0 else 0,
+            'end_systolic_volume_ml': self.volumes_ml[self.min_vol_frame_idx] if len(self.volumes_ml) > 0 else 0,
+            'segmental_results': self.segmental_strain_results
         }
-        if len(self.gls_curve) > 0:
-            results['peak_global_longitudinal_strain'] = np.min(self.gls_curve)
-        if len(self.volumes_ml) > 0:
-            results['end_diastolic_volume_ml'] = np.max(self.volumes_ml)
-            results['end_systolic_volume_ml'] = np.min(self.volumes_ml)
         return results
 
+    def visualize_bulls_eye(self):
+        """Generates a 17-segment bulls-eye plot for segmental strain."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.colors as mcolors
+        except ImportError:
+            print("Matplotlib is required for visualization.")
+            return
+
+        aha_map = {
+            'Basal Septal': 2, 'Mid Septal': 8, 'Apical Septal': 14,
+            'Basal Lateral': 5, 'Mid Lateral': 11, 'Apical Lateral': 16,
+            'Apical Cap': 17
+        }
+
+        strain_data = {aha_map[key]: val for key, val in self.segmental_strain_results.items()}
+        
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(projection='polar'))
+        ax.set_theta_zero_location('N'); ax.set_theta_direction(-1)
+        ax.set_yticklabels([]); ax.set_xticklabels([]); ax.spines['polar'].set_visible(False)
+
+        cmap = plt.get_cmap('RdYlGn_r'); norm = mcolors.Normalize(vmin=-30, vmax=0)
+
+        radii = [0.25, 0.65, 1.0]; angles = np.deg2rad(np.array([210, 270, 330, 30, 90, 150, 210]))
+
+        for i in range(1, 18):
+            color = cmap(norm(strain_data.get(i, -15)));
+            if i not in strain_data: color = 'lightgrey'
+                
+            if i <= 6: ax.bar(angles[i-1], radii[2]-radii[1], width=np.deg2rad(60), bottom=radii[1], color=color, edgecolor='white', lw=2)
+            elif i <= 12: ax.bar(angles[i-7], radii[1]-radii[0], width=np.deg2rad(60), bottom=radii[0], color=color, edgecolor='white', lw=2)
+            elif i <= 16: ax.bar(angles[i-13], radii[0], width=np.deg2rad(60), color=color, edgecolor='white', lw=2)
+            else: ax.bar(0, radii[0], width=np.deg2rad(360), color=color, edgecolor='white', lw=1)
+                
+            if i in strain_data:
+                angle_mid = angles[i-1] + np.deg2rad(30) if i <= 6 else angles[i-7] + np.deg2rad(30) if i <= 12 else angles[i-13] + np.deg2rad(30) if i <=16 else 0
+                radius_mid = (radii[2]+radii[1])/2 if i <=6 else (radii[1]+radii[0])/2 if i<=12 else radii[0]/2
+                if i == 17: radius_mid = 0
+                ax.text(angle_mid, radius_mid, f"{strain_data[i]:.1f}", ha='center', va='center', fontsize=10, color='black')
+
+        ax.set_rmax(1.0); fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, pad=0.1, label='Peak Systolic Strain (%)')
+        ax.set_title('AHA 17-Segment Model (A4C View)'); plt.show()
+
     def visualize_motion(self, save_animation: bool = False, filename: str = 'lv_motion.gif'):
-        """Visualizes the final contour against the raw data and key landmarks."""
-        if not self.resampled_contours:
-            raise RuntimeError("Run .analyze() first.")
+        if not self.resampled_contours: raise RuntimeError("Run .analyze() first.")
         try:
             import matplotlib.pyplot as plt
             from matplotlib.animation import FuncAnimation
             from matplotlib.widgets import Button, Slider
         except ImportError:
-            print("Matplotlib is required for visualization. Please run: pip install matplotlib")
+            print("Matplotlib is required for visualization.")
             return
         
-        fig, ax = plt.subplots(figsize=(8, 8))
-        plt.subplots_adjust(bottom=0.2)  # Make room for widgets
+        fig, ax = plt.subplots(figsize=(8, 8)); plt.subplots_adjust(bottom=0.2)
+        all_points = np.vstack(self.raw_contours); pad = (all_points[:,0].max() - all_points[:,0].min()) * 0.1
+        ax.set_xlim(all_points[:,0].min()-pad, all_points[:,0].max()+pad); ax.set_ylim(all_points[:,1].min()-pad, all_points[:,1].max()+pad)
+        ax.set_aspect('equal', 'box'); ax.set_title('LV Motion'); ax.grid(True)
 
-        all_points = np.vstack(self.raw_contours)
-        pad = (all_points[:,0].max() - all_points[:,0].min()) * 0.1
-        ax.set_xlim(all_points[:,0].min()-pad, all_points[:,0].max()+pad)
-        ax.set_ylim(all_points[:,1].min()-pad, all_points[:,1].max()+pad)
-        ax.set_aspect('equal', 'box')
-        ax.set_title(f'LV Motion (Smoothing Factor: {self.smoothing_factor})')
-        ax.grid(True)
-
-        line, = ax.plot([], [], '-', lw=2, c='dodgerblue', label='Smoothed Contour')
+        line, = ax.plot([], [], '-', lw=2, c='dodgerblue', label='Endo Contour')
+        epi_line, = ax.plot([], [], '-', lw=2, c='cyan', label='Epi Contour')
         raw_line, = ax.plot([], [], 'o', markersize=2, linestyle=':', lw=1, c='gray', label='Raw Points')
         base_line, = ax.plot([], [], '-', c='limegreen', lw=3, label='Mitral Base (raw)')
         ref_apex_pt = self.raw_contours[0][self.apex_index_ref]
-        apex_dot, = ax.plot([ref_apex_pt[0]], [ref_apex_pt[1]], '*', c='red', ms=15, label=f'Apex (Ref Frame {self.apex_index_ref})')
+        apex_dot, = ax.plot([ref_apex_pt[0]], [ref_apex_pt[1]], '*', c='red', ms=15, label=f'Apex')
         mitral_dots, = ax.plot([], [], 'o', c='gold', ms=10, label='Mitral Points (raw)')
         time_text = ax.text(0.05, 0.95, '', transform=ax.transAxes, va='top', bbox=dict(boxstyle='round,pad=0.5', fc='wheat', alpha=0.5))
         ax.legend(loc='upper right')
 
-        self.segment_labels = []
-
-        # --- Animation Control ---
-        is_paused = [False] # Use a list to make it mutable inside callbacks
+        is_paused = [False]
 
         def update(frame_index):
-            i = int(frame_index) # Ensure frame_index is an integer
-            for label in self.segment_labels:
-                label.remove()
-            self.segment_labels.clear()
-
-            if len(self.resampled_contours[i]) == 0:
-                return
-            
-            raw = self.raw_contours[i]
+            i = int(frame_index)
             line.set_data(self.resampled_contours[i][:,0], self.resampled_contours[i][:,1])
-            raw_line.set_data(raw[:,0], raw[:,1])
-            p1, p_end = raw[0], raw[-1]
-            base_line.set_data([p1[0], p_end[0]], [p1[1], p_end[1]])
+            epi_line.set_data(self.resampled_epi_contours[i][:,0], self.resampled_epi_contours[i][:,1])
+            raw = self.raw_contours[i]; raw_line.set_data(raw[:,0], raw[:,1])
+            p1, p_end = raw[0], raw[-1]; base_line.set_data([p1[0], p_end[0]], [p1[1], p_end[1]])
             mitral_dots.set_data([p1[0], p_end[0]], [p1[1], p_end[1]])
             time_text.set_text(f"Frame: {i}\nTime: {self.times_sec[i]:.3f}s\nVolume: {self.volumes_ml[i]:.2f}ml\nGLS: {self.gls_curve[i]:.2f}%")
-
-            #if i == self.min_len_frame_idx or i == self.max_len_frame_idx:
-            min_lengths = self.all_segment_lengths_mm[self.min_len_frame_idx]
-            max_lengths = self.all_segment_lengths_mm[self.max_len_frame_idx]
-            
-            with open('valueDumpMAX.txt', 'w') as file:
-                for item in max_lengths:
-                    file.write(f"{item}\n")
-                    
-            with open('valueDumpMIN.txt', 'w') as file:
-                for item in min_lengths:
-                    file.write(f"{item}\n")
-                    
-            if len(min_lengths) == len(max_lengths):
-                current_contour = self.resampled_contours[i]
-                for j in range(len(current_contour) - 1):
-                    p1, p2 = current_contour[j], current_contour[j+1]
-                    midpoint = (p1 + p2) / 2.0
-                    label_text = f"{self.all_segment_lengths_mm[i][j]:.4g}"
-                    text_artist = ax.text(midpoint[0], midpoint[1], label_text, fontsize=6, color='white', ha='center', va='center', bbox=dict(boxstyle='round,pad=0.1', fc='black', alpha=0.6), zorder=10)
-                    self.segment_labels.append(text_artist)
             fig.canvas.draw_idle()
 
-        anim = FuncAnimation(fig, update, frames=len(self.resampled_contours), interval=50)
-
-        # --- Widgets ---
-        ax_pause = plt.axes([0.7, 0.025, 0.1, 0.04])
-        btn_pause = Button(ax_pause, 'Pause', color='lightgoldenrodyellow', hovercolor='0.975')
-
+        anim = FuncAnimation(fig, update, frames=len(self.resampled_contours), blit=False, interval=50)
+        ax_pause = plt.axes([0.7, 0.05, 0.1, 0.04]); btn_pause = Button(ax_pause, 'Pause')
         def toggle_pause(event):
-            if is_paused[0]:
-                anim.resume()
-                btn_pause.label.set_text('Pause')
-            else:
-                anim.pause()
-                btn_pause.label.set_text('Play')
+            if is_paused[0]: anim.resume(); btn_pause.label.set_text('Pause')
+            else: anim.pause(); btn_pause.label.set_text('Play')
             is_paused[0] = not is_paused[0]
-            fig.canvas.draw_idle()
-
         btn_pause.on_clicked(toggle_pause)
 
-        ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03])
-        frame_slider = Slider(
-            ax=ax_slider,
-            label='Frame',
-            valmin=0,
-            valmax=len(self.resampled_contours) - 1,
-            valinit=0,
-            valstep=1
-        )
-        
+        ax_slider = plt.axes([0.2, 0.02, 0.65, 0.03]); frame_slider = Slider(ax_slider, 'Frame', 0, len(self.resampled_contours)-1, valinit=0, valstep=1)
         def set_frame(val):
-            if not is_paused[0]:
-                toggle_pause(None) # Pause the animation if slider is used
+            if not is_paused[0]: toggle_pause(None)
             update(val)
-
         frame_slider.on_changed(set_frame)
 
-        update(0) # Initialize the plot to the first frame
+        update(0)
         plt.show()
 
 # --- Main execution block ---
 if __name__ == "__main__":
     xml_file = "validation.xml" 
-    
     smoothing_factor = 20.0 
     
     try:
-        analyzer = CardiacAnalyzer(xml_file, smoothing_factor=smoothing_factor, num_points=49)
+        analyzer = CardiacAnalyzer(xml_file, smoothing_factor=smoothing_factor, num_points=130)
         analysis_results = analyzer.analyze()
         
         print("\n--- Final Analysis Results ---")
-        print(f"Using Smoothing Factor: {smoothing_factor}")
-        print(f"Ejection Fraction (EF): {analysis_results['ejection_fraction']:.2f} %")
-        print(f"Peak Global Longitudinal Strain (GLS): {analysis_results['peak_global_longitudinal_strain']:.2f} %")
-        print(f"End-Diastolic Volume (EDV): {analysis_results['end_diastolic_volume_ml']:.2f} ml")
-        print(f"End-Systolic Volume (ESV): {analysis_results['end_systolic_volume_ml']:.2f} ml")
+        print(f"  Ejection Fraction (EF): {analysis_results['ejection_fraction']:.2f} %")
+        print(f"  Peak Endo GLS: {analysis_results['peak_global_longitudinal_strain']:.2f} %")
+        print(f"  Peak Epi GLS: {analysis_results['peak_epi_gls']:.2f} %")
+        print(f"  Peak Strain Rate: {analysis_results['peak_strain_rate']:.2f} %/s")
+        print(f"  End-Diastolic Volume (EDV): {analysis_results['end_diastolic_volume_ml']:.2f} ml")
+        print(f"  End-Systolic Volume (ESV): {analysis_results['end_systolic_volume_ml']:.2f} ml")
+        print("\n--- Peak Segmental Strain (%) ---")
+        for segment, strain in analysis_results['segmental_results'].items():
+            print(f"  {segment:<15}: {strain:.2f}")
         print("----------------------------------\n")
 
-        print("Starting visualization...")
+        print("Starting interactive motion visualization...")
         analyzer.visualize_motion()
+        
+        print("Displaying segmental strain bulls-eye plot...")
+        analyzer.visualize_bulls_eye()
         
     except (FileNotFoundError, ValueError, RuntimeError, ImportError) as e:
         print(f"\nAN ERROR OCCURRED: {e}")
